@@ -4,7 +4,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import TensorDataset, DataLoader, Dataset
 from sklearn.preprocessing import MinMaxScaler
 import matplotlib.pyplot as plt
 from joblib import dump
@@ -32,7 +32,7 @@ set_seed(42)
 # ==============================
 # 1. 데이터 로드 (스케일된 6자유도, 여러 파일)
 # ==============================
-DATA_DIR = "data_6dof_scaled"   # 스케일된 파일들이 있는 폴더
+DATA_DIR = "data_6dof_scaled"
 file_paths = sorted(glob.glob(os.path.join(DATA_DIR, "*.csv")))
 print("발견된 파일 수:", len(file_paths))
 
@@ -44,57 +44,93 @@ dof_cols = ["surge", "sway", "heave", "roll", "pitch", "yaw"]
 all_list = []
 for p in file_paths:
     df = pd.read_csv(p)
-    # 필요한 컬럼만 사용 (이미 0~1로 스케일된 상태라고 가정)
-    all_list.append(df[dof_cols].values)
+    all_list.append(df[dof_cols].values.astype(np.float32))
 
 data_6dof = np.concatenate(all_list, axis=0)   # (T_total, 6)
 print("전체 6자유도 데이터 shape:", data_6dof.shape)
 
 # ==============================
-# 2. Split (Train / Val / Test)  ← 여기선 추가 스케일링 안함
-# ==============================
-train_size = int(len(data_6dof) * 0.7)
-val_size   = int(len(data_6dof) * 0.15)
-train_data = data_6dof[:train_size]
-val_data   = data_6dof[train_size:train_size + val_size]
-test_data  = data_6dof[train_size + val_size:]
-
-# 이미 0~1로 스케일되어 있으므로 그대로 사용
-train_scaled = train_data.astype(np.float32)
-val_scaled   = val_data.astype(np.float32)
-test_scaled  = test_data.astype(np.float32)
-
-print("\n데이터 분할 완료.")
-print(f"Train: {len(train_data)}, Validation: {len(val_data)}, Test: {len(test_data)}")
-
-# ==============================
-# 3. 슬라이딩 윈도우
+# 2. 윈도우 개수 계산 + 인덱스 랜덤 Split
 # ==============================
 sampling_rate = 10        # Hz
-IN_LEN  = int(12.8 * sampling_rate)
-OUT_LEN = int(12.8 * sampling_rate)
-STRIDE  = 1
+IN_LEN  = 256            # 입력 시퀀스 길이
+OUT_LEN = 256            # 출력 시퀀스 길이
+STRIDE = 16
+N_total   = len(data_6dof)
+N_window  = N_total - IN_LEN - OUT_LEN + 1  # 만들 수 있는 전체 윈도우 수
+print("전체 윈도우 개수:", N_window)
 
-def make_windows(arr, in_len=IN_LEN, out_len=OUT_LEN, stride=STRIDE):
+all_indices = np.random.permutation(N_window)
+
+train_ratio = 0.7
+val_ratio   = 0.15  # 나머지 0.15는 test
+
+n_train = int(N_window * train_ratio)
+n_val   = int(N_window * val_ratio)
+n_test  = N_window - n_train - n_val
+
+idx_train = all_indices[:n_train]
+idx_val   = all_indices[n_train:n_train + n_val]
+idx_test  = all_indices[n_train + n_val:]
+
+print("\n랜덤 윈도우 분할 완료.")
+print(f"Train windows: {len(idx_train)}, Val: {len(idx_val)}, Test: {len(idx_test)}")
+
+class TimeWindowDataset(Dataset):
     """
-    arr: (T, 6) numpy array (scaled)
-    return: torch.Tensor X:(N,in_len,6), Y:(N,out_len,6)
+    data_6dof 전체에서
+    시작 인덱스 리스트(indices)를 기준으로
+    (IN_LEN, 6) 입력과 (OUT_LEN, 6) 타깃을 잘라내는 Dataset
     """
-    X, Y = [], []
-    N = len(arr)
-    for s in range(0, N - in_len - out_len + 1, stride):
-        X.append(arr[s:s+in_len])
-        Y.append(arr[s+in_len:s+in_len+out_len])
-    X = np.array(X, dtype=np.float32)
-    Y = np.array(Y, dtype=np.float32)
-    return torch.from_numpy(X), torch.from_numpy(Y)
+    def __init__(self, data: np.ndarray, indices: np.ndarray,
+                 in_len: int = IN_LEN, out_len: int = OUT_LEN):
+        self.data    = torch.from_numpy(data.astype(np.float32))  # (T_total, 6)
+        self.indices = indices.astype(np.int64)
+        self.in_len  = in_len
+        self.out_len = out_len
 
-X_train, y_train = make_windows(train_scaled)
-X_val,   y_val   = make_windows(val_scaled)
-X_test,  y_test  = make_windows(test_scaled)
+    def __len__(self):
+        return len(self.indices)
 
-print(f"윈도우 생성 완료 - X_train:{tuple(X_train.shape)}, y_train:{tuple(y_train.shape)}")
-# 예: (N, 100, 6), (N, 100, 6)
+    def __getitem__(self, idx):
+        s = int(self.indices[idx])
+        e_in  = s + self.in_len
+        e_out = e_in + self.out_len
+        x = self.data[s:e_in, :]      # (IN_LEN, 6)
+        y = self.data[e_in:e_out, :]  # (OUT_LEN, 6)
+        return x, y
+# ==============================
+# 3. STRIDE 적용한 윈도우 시작 인덱스 생성 + Dataset/DataLoader 준비
+# ==============================
+# STRIDE 반영: 시작점 후보를 0, STRIDE, 2*STRIDE, ...
+starts = np.arange(0, N_total - IN_LEN - OUT_LEN + 1, STRIDE, dtype=np.int64)
+print("STRIDE 적용 윈도우 개수:", len(starts))
+
+all_indices = np.random.permutation(len(starts))
+n_train = int(len(starts) * train_ratio)
+n_val   = int(len(starts) * val_ratio)
+n_test  = len(starts) - n_train - n_val
+
+idx_train = all_indices[:n_train]
+idx_val   = all_indices[n_train:n_train + n_val]
+idx_test  = all_indices[n_train + n_val:]
+
+train_starts = starts[idx_train]
+val_starts   = starts[idx_val]
+test_starts  = starts[idx_test]
+
+train_ds = TimeWindowDataset(data_6dof, train_starts, IN_LEN, OUT_LEN)
+val_ds   = TimeWindowDataset(data_6dof, val_starts,   IN_LEN, OUT_LEN)
+test_ds  = TimeWindowDataset(data_6dof, test_starts,  IN_LEN, OUT_LEN)
+
+def build_loaders(batch_size):
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  drop_last=True)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, drop_last=False)
+    test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, drop_last=False)
+    return train_loader, val_loader, test_loader
+
+# plotting에서 쓰는 test_scaled도 정의(현재 data_6dof가 이미 scaled라고 가정)
+test_scaled = data_6dof
 
 # ==============================
 # 4. Encoder / Decoder / Seq2Seq (멀티출력 지원)
@@ -411,7 +447,7 @@ def plot_history(train_hist, val_hist, model_name):
     plt.close()
 
 # ==============================
-# 7. 10초 입력 + 10초 예측(20초 그래프)
+# 7. 예측(그래프)
 # ==============================
 def truth_10s_scaled_6dof(test_scaled, start_idx, in_len, fs):
     """
@@ -419,7 +455,7 @@ def truth_10s_scaled_6dof(test_scaled, start_idx, in_len, fs):
     start_idx  : 윈도우 시작 인덱스 (make_windows에서의 s)
     반환: (10*fs, 6)
     """
-    need = int(12.8 * fs)
+    need = int(25.6 * fs)
     s = start_idx + in_len
     e = s + need
     return test_scaled[s:e, :]   # (need, 6)
@@ -448,11 +484,11 @@ def plot_input_output_10s_all(X_input, pred_10s, truth_10s, fs, title,
     for d in range(6):
         ax = axes[d]
         ax.plot(t_input, X_input[:, d],
-                label="Input (last 12.8s)", linestyle="--", alpha=0.7)
+                label="Input (last 25.6s)", linestyle="--", alpha=0.7)
         ax.plot(t_pred,  truth_10s[:, d],
-                label="Truth (next 12.8s)", linewidth=1.0)
+                label="Truth (next 25.6s)", linewidth=1.0)
         ax.plot(t_pred,  pred_10s[:, d],
-                label="Pred (next 12.8s)",  linewidth=1.0)
+                label="Pred (next 25.6s)",  linewidth=1.0)
         ax.axvline(0, color="k", linestyle=":", alpha=0.5)
         ax.set_ylabel(dof_names[d])
         ax.grid(True)
@@ -463,7 +499,7 @@ def plot_input_output_10s_all(X_input, pred_10s, truth_10s, fs, title,
     axes[0].legend(loc="upper right", fontsize=8)
     plt.tight_layout()
     os.makedirs("results", exist_ok=True)
-    plt.savefig(f"results/ALLDOF_{title.replace(' ','_')}_input+output_10s.png")
+    plt.savefig(f"results/ALLDOF_{title.replace(' ','_')}_input+output.png")
     plt.close()
 
 
@@ -485,28 +521,6 @@ MAX_EPOCHS = 100
 PATIENCE   = 10
 LR         = 1e-3
 TFR        = 0.5
-
-# 랜덤 탐색 공간 (지금은 CNN-Bi-GRU만)
-space_random = {
-    'model_type': ['CNN-Bi-GRU'],  # 필요하면 'Bi-GRU' 등 추가
-    'n_layers':   [2],
-    'hidden_size':[128],
-    'batch_size': [32],
-}
-
-def sample_trial():
-    return {
-        'model_type': random.choice(space_random['model_type']),
-        'n_layers':   random.choice(space_random['n_layers']),
-        'hidden_size':random.choice(space_random['hidden_size']),
-        'batch_size': random.choice(space_random['batch_size']),
-    }
-
-def build_loaders(batch_size):
-    train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=batch_size, shuffle=True,  drop_last=True)
-    val_loader   = DataLoader(TensorDataset(X_val,   y_val),   batch_size=batch_size, shuffle=False, drop_last=False)
-    test_loader  = DataLoader(TensorDataset(X_test,  y_test),  batch_size=batch_size, shuffle=False, drop_last=False)
-    return train_loader, val_loader, test_loader
 
 def build_model(model_type, n_layers, hidden_size, cnn_params=None):
     """
@@ -547,18 +561,18 @@ def build_model(model_type, n_layers, hidden_size, cnn_params=None):
 def objective(trial):
     # ---- 공통 RNN 하이퍼파라미터 샘플링 ----
     model_type = trial.suggest_categorical("model_type", ["CNN-Bi-GRU"])
-    n_layers   = trial.suggest_int("n_layers", low = 1, high = 1)
-    hidden_size= trial.suggest_categorical("hidden_size", [64])
-    batch_size = trial.suggest_categorical("batch_size", [16])
+    n_layers   = trial.suggest_int("n_layers", low = 2, high = 2)
+    hidden_size= trial.suggest_categorical("hidden_size", [128])
+    batch_size = trial.suggest_categorical("batch_size", [32])
     
 
     # ---- CNN block 하이퍼파라미터 샘플링 ----
-    cnn_c1 = trial.suggest_categorical("cnn_c1", [32])
+    cnn_c1 = trial.suggest_categorical("cnn_c1", [64])
     cnn_c2 = trial.suggest_categorical("cnn_c2", [64])
-    k1     = trial.suggest_categorical("cnn_k1", [9])   # 첫 conv kernel
-    k2     = trial.suggest_categorical("cnn_k2", [9])
-    k3     = trial.suggest_categorical("cnn_k3", [5])
-    cnn_dropout = trial.suggest_float("cnn_dropout", 0.0, 0.0)
+    k1     = trial.suggest_categorical("cnn_k1", [15])   # 첫 conv kernel
+    k2     = trial.suggest_categorical("cnn_k2", [11])
+    k3     = trial.suggest_categorical("cnn_k3", [7])
+    cnn_dropout = trial.suggest_float("cnn_dropout", 0.1, 0.1)
 
     cnn_params = dict(
         cnn_c1=cnn_c1,
@@ -601,23 +615,23 @@ def objective(trial):
 # # ==============================
 # # 10. Optuna Study 실행
 # # ==============================
-# N_TRIALS = 1  # 하고 싶은 만큼 
+N_TRIALS = 1  # 하고 싶은 만큼 
 
-# study = optuna.create_study(
-#     direction="minimize",
-#     pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=5),
-# )
-# study.optimize(objective, n_trials=N_TRIALS)
+study = optuna.create_study(
+    direction="minimize",
+    pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=5),
+)
+study.optimize(objective, n_trials=N_TRIALS)
 
-# # 결과 저장
-# os.makedirs("results", exist_ok=True)
-# df_trials = study.trials_dataframe()
-# df_trials.to_csv("results/optuna_trials_6dof.csv", index=False)
+# 결과 저장
+os.makedirs("results", exist_ok=True)
+df_trials = study.trials_dataframe()
+df_trials.to_csv("results/optuna_trials_6dof.csv", index=False)
 
-# print("=== Optuna Best Trial ===")
-# print("Number:", study.best_trial.number)
-# print("Value (best val MSE):", study.best_trial.value)
-# print("Params:", study.best_trial.params)
+print("=== Optuna Best Trial ===")
+print("Number:", study.best_trial.number)
+print("Value (best val MSE):", study.best_trial.value)
+print("Params:", study.best_trial.params)
 
 # ==============================
 # 11. Optuna Best Trial 체크포인트 로드해서 그대로 평가 & 예측
@@ -694,14 +708,19 @@ criterion = nn.MSELoss()
 test_mse = evaluate(best_model, test_loader, criterion)
 print(f"\n[Best Trial Model] Test MSE: {test_mse:.6f}")
 
-# 8) 12.8초 입력 + 12.8초 예측 (그래프 저장)
-if len(X_test) >= 1:
+# 8) 입력/예측/정답 그래프 저장
+if len(test_ds) >= 1:
     idx = 0
-    X_start = X_test[idx:idx+1]          # (1, IN_LEN, 6) scaled
+    X_start, _ = test_ds[idx]                 # (IN_LEN, 6), (OUT_LEN, 6)
+    X_start = X_start.unsqueeze(0)            # (1, IN_LEN, 6)
+
     pred_10s_all = predict_10s_direct(best_model, X_start)  # (OUT_LEN, 6)
 
-    X_input_all   = X_start.squeeze(0).cpu().numpy()
-    truth_10s_all = truth_10s_scaled_6dof(test_scaled, idx, IN_LEN, sampling_rate)
+    X_input_all = X_start.squeeze(0).cpu().numpy()
+
+    # 여기 중요: start index는 "idx"가 아니라 test_starts[idx]
+    start_idx = int(test_starts[idx])
+    truth_10s_all = truth_10s_scaled_6dof(test_scaled, start_idx, IN_LEN, sampling_rate)
 
     model_name = f"{best_model_type}_L{best_n_layers}_H{best_hidden}_B{best_batch}_6DOF_OPTUNA"
     plot_input_output_10s_all(
@@ -711,4 +730,3 @@ if len(X_test) >= 1:
         sampling_rate,
         f"{model_name}_ALL_DOF"
     )
-    print("12.8초 입력 + 12.8초 예측 (모든 자유도) 저장 완료.")
