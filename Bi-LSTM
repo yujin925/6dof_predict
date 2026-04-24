@@ -1,0 +1,498 @@
+import os
+import glob
+import random
+import numpy as np
+import pandas as pd
+import torch
+import math
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim.lr_scheduler import ReduceLROnPlateau  
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+
+# ==============================
+# 0. Device & Seed
+# ==============================
+device_ids = [6]
+primary_device = "cuda:6"
+device = torch.device(primary_device if torch.cuda.is_available() else "cpu")
+print("Using GPUs:", device_ids)
+
+os.makedirs('models', exist_ok=True)
+os.makedirs('results', exist_ok=True)
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+set_seed(42)
+
+# ==============================
+# 1. 데이터 로드 (스케일된 6자유도, 여러 파일)
+# ==============================
+DATA_DIR = "data_6dof_scaled"
+file_paths = sorted(glob.glob(os.path.join(DATA_DIR, "*.csv")))
+print("발견된 파일 수:", len(file_paths))
+
+if len(file_paths) == 0:
+    raise RuntimeError("data_6dof_scaled 폴더에 csv가 없습니다. 경로를 확인해주세요.")
+
+dof_cols = ["surge", "sway", "heave", "roll", "pitch", "yaw"]
+
+all_list = []
+file_lengths = [] # 각 파일의 길이를 저장할 리스트
+
+for p in file_paths:
+    df = pd.read_csv(p)
+    arr = df[dof_cols].values.astype(np.float32)
+    all_list.append(arr)
+    file_lengths.append(len(arr)) # 파일 길이 기록
+
+data_6dof = np.concatenate(all_list, axis=0)   # (T_total, 6)
+print("전체 6자유도 데이터 shape:", data_6dof.shape)
+
+# ==============================
+# 2. 윈도우 개수 계산 (경계선 침범 방지 + STRIDE 적용)
+# ==============================
+sampling_rate = 10        # Hz
+IN_LEN  = 256             # 입력 시퀀스 길이
+OUT_LEN = 256             # 출력 시퀀스 길이
+STRIDE = 4                # 윈도우 이동 간격
+
+valid_starts = []
+current_offset = 0
+
+# 각 파일별로 안전한 윈도우 시작점만 추출
+for L in file_lengths:
+    max_start = L - IN_LEN - OUT_LEN
+    if max_start >= 0:
+        # 해당 파일 내에서 STRIDE 간격으로 시작 인덱스 생성
+        starts = np.arange(0, max_start + 1, STRIDE) + current_offset
+        valid_starts.extend(starts)
+    current_offset += L
+
+valid_starts = np.array(valid_starts)
+N_window = len(valid_starts)
+print("안전하게 추출된 전체 윈도우 개수:", N_window)
+
+# 안전한 인덱스들을 무작위로 섞음
+all_indices = np.random.permutation(valid_starts)
+
+train_ratio = 0.7
+val_ratio   = 0.15  # 나머지 0.15는 test
+
+n_train = int(N_window * train_ratio)
+n_val   = int(N_window * val_ratio)
+n_test  = N_window - n_train - n_val
+
+idx_train = all_indices[:n_train]
+idx_val   = all_indices[n_train:n_train + n_val]
+idx_test  = all_indices[n_train + n_val:]
+
+print(f"Train windows: {len(idx_train)}, Val: {len(idx_val)}, Test: {len(idx_test)}")
+
+# ==============================
+# 3. Dataset & DataLoader
+# ==============================
+class TimeWindowDataset(Dataset):
+    def __init__(self, data: np.ndarray, indices: np.ndarray, in_len: int = IN_LEN, out_len: int = OUT_LEN):
+        self.data    = torch.from_numpy(data.astype(np.float32))
+        self.indices = indices.astype(np.int64)
+        self.in_len  = in_len
+        self.out_len = out_len
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        s = int(self.indices[idx])
+        e_in  = s + self.in_len
+        e_out = e_in + self.out_len
+        x = self.data[s:e_in, :]      # (IN_LEN, 6)
+        y = self.data[e_in:e_out, :]  # (OUT_LEN, 6)
+        return x, y
+
+BATCH_SIZE = 64 
+train_loader = DataLoader(TimeWindowDataset(data_6dof, idx_train), batch_size=BATCH_SIZE, shuffle=True, drop_last=True, num_workers=4, pin_memory=True)
+val_loader   = DataLoader(TimeWindowDataset(data_6dof, idx_val), batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+test_loader  = DataLoader(TimeWindowDataset(data_6dof, idx_test), batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+
+# -----------------------------
+# Single-Shot Many-to-Many RNN
+# -----------------------------
+class SingleShotRNN(nn.Module):
+    def __init__(self, input_dim=6, output_dim=6, in_len=256, out_len=256, 
+                 hidden_dim=256, n_layers=4, bidirectional=True, rnn_type="GRU"):
+        super().__init__()
+        self.in_len = in_len
+        self.out_len = out_len
+        self.output_dim = output_dim
+        
+        RNN = nn.LSTM if rnn_type.upper() == "LSTM" else nn.GRU
+        self.rnn = RNN(input_dim, hidden_dim, n_layers, batch_first=True, bidirectional=bidirectional)
+        
+        # 양방향(Bi-directional)이면 은닉 상태 크기가 2배가 됨
+        D = 2 if bidirectional else 1
+        
+        # RNN의 마지막 타임스텝 결과를 받아, 미래 전체(out_len * output_dim)를 한 번에 예측
+        self.fc = nn.Linear(hidden_dim * D, out_len * output_dim)
+
+    def forward(self, x):
+        # x: (Batch, IN_LEN, 6)
+        out, _ = self.rnn(x) # out: (Batch, IN_LEN, hidden_dim * D)
+        
+        # 과거 데이터를 모두 읽은 후의 마지막 상태(last hidden state)만 추출
+        last_hidden = out[:, -1, :] # (Batch, hidden_dim * D)
+        
+        # 한 번의 계산(Single-Shot)으로 미래 데이터를 모두 예측
+        pred = self.fc(last_hidden) # (Batch, OUT_LEN * 6)
+        
+        # (Batch, OUT_LEN * 6) -> (Batch, OUT_LEN, 6) 형태로 변환하여 반환
+        pred = pred.view(-1, self.out_len, self.output_dim)
+        return pred
+
+
+import json
+import torch.optim as optim
+import optuna
+from optuna.pruners import MedianPruner
+
+# ==============================
+# 5. Seq2Seq 전용 Training & Evaluation Loops
+# ==============================
+class EarlyStopping:
+    def __init__(self, patience=10, delta=0, path='models/checkpoint.pt'):
+        self.patience = patience
+        self.delta = delta
+        self.path = path
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+
+    def __call__(self, val_loss, model):
+        score = -val_loss
+        if self.best_score is None or score > self.best_score + self.delta:
+            self.best_score = score
+            torch.save(model.state_dict(), self.path)
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+
+def train(model, loader, optimizer, criterion):
+    model.train()
+    epoch_loss = 0.0
+    for src, trg in tqdm(loader, desc="Train(step)", leave=False):
+        src, trg = src.to(device), trg.to(device)
+        
+        optimizer.zero_grad()
+        output = model(src)  # TFR, Target 입력 모두 제거됨
+        loss = criterion(output, trg)
+        loss.backward()
+        optimizer.step()
+        
+        epoch_loss += loss.item()
+    return epoch_loss / max(1, len(loader))
+
+@torch.no_grad()
+def evaluate(model, loader, criterion):
+    model.eval()
+    epoch_loss = 0.0
+    for src, trg in tqdm(loader, desc="Valid(step)", leave=False):
+        src, trg = src.to(device), trg.to(device)
+        
+        output = model(src)  # TFR, Target 입력 모두 제거됨
+        loss = criterion(output, trg)
+        
+        epoch_loss += loss.item()
+    return epoch_loss / max(1, len(loader))
+
+def build_model(model_type, n_layers, hidden_size):
+    model_type = model_type.upper()
+    if model_type not in ["LSTM", "BI-LSTM", "GRU", "BI-GRU"]:
+        raise ValueError(f"Unknown model_type: {model_type}")
+
+    is_bi = ("BI" in model_type)
+    rnn_core = "GRU" if "GRU" in model_type else "LSTM"
+
+    model = SingleShotRNN(
+        input_dim=6,          # 수정됨
+        output_dim=6,         # 수정됨
+        in_len=IN_LEN, 
+        out_len=OUT_LEN,
+        hidden_dim=hidden_size, 
+        n_layers=n_layers, 
+        bidirectional=is_bi, 
+        rnn_type=rnn_core
+    ).to(device)
+
+
+    return model
+
+
+# ===========================
+# 🔧 Optuna: 하이퍼파라미터 튜닝
+# ===========================
+USE_GRAD_TRACKER_FOR_BEST = True
+MAX_EPOCHS = 300
+PATIENCE   = 15
+
+LR = 1e-3
+
+def objective(trial: optuna.Trial):
+    model_type  = trial.suggest_categorical("model_type", ["Bi-GRU", "Bi-LSTM"])
+    n_layers    = trial.suggest_int("n_layers", low=1, high=5)
+    hidden_size = trial.suggest_categorical("hidden_size", [64, 128, 256])
+    batch_size  = trial.suggest_categorical("batch_size", [64, 128])
+
+    lr  = LR
+
+    set_seed(100 + trial.number)
+
+    # DataLoader 
+    train_loader_opt = DataLoader(TimeWindowDataset(data_6dof, idx_train), batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
+    val_loader_opt   = DataLoader(TimeWindowDataset(data_6dof, idx_val), batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+
+    model = build_model(model_type, n_layers, hidden_size)
+    
+    # 1. 옵티마이저 선언
+    opt   = optim.Adam(model.parameters(), lr=lr)
+    
+    # 2. 🔥 스케줄러 선언 추가
+    scheduler = ReduceLROnPlateau(
+        opt,
+        mode='min',
+        factor=0.5,
+        patience=5,
+        min_lr=1e-6
+    )
+    
+    crit  = nn.MSELoss()
+
+    ckpt_path = f"models/{model_type}_L{n_layers}_H{hidden_size}_B{batch_size}.pt"
+    trial.set_user_attr("ckpt_path", ckpt_path)
+    es = EarlyStopping(patience=PATIENCE, path=ckpt_path)
+
+    tr_hist, va_hist = [], []
+    best_va = float("inf")
+
+    for ep in range(1, MAX_EPOCHS + 1):
+        tr_loss = train(model, train_loader_opt, opt, crit)
+        va_loss = evaluate(model, val_loader_opt, crit)
+        
+        # 3. 🔥 검증 손실(va_loss)을 기준으로 스케줄러 업데이트
+        scheduler.step(va_loss)
+        
+
+        tr_hist.append(tr_loss)
+        va_hist.append(va_loss)
+
+        trial.report(va_loss, ep)
+        if trial.should_prune():
+            raise optuna.exceptions.TrialPruned()
+       
+        print(f"Epoch {ep:03d}/{MAX_EPOCHS:03d} | Train Loss (MSE): {tr_loss:.4f} | Val Loss (MSE): {va_loss:.4f}")
+        es(va_loss, model)
+        if va_loss < best_va: 
+            best_va = va_loss
+            
+        if es.early_stop: 
+            print(f"Early stopping triggered at epoch {ep}")
+            break
+
+    model_name = f"{model_type}_L{n_layers}_H{hidden_size}_B{batch_size}"
+    try:
+        with open(f"results/{model_name}_history.json","w") as f:
+            json.dump({'train': tr_hist, 'val': va_hist}, f)
+    except Exception as e:
+        print(f"Save history error: {e}")
+
+    return best_va
+
+if __name__ == "__main__":
+    study = optuna.create_study(direction="minimize", pruner=MedianPruner(n_warmup_steps=10))000
+    # =========================================================
+    # 🔥 추가된 부분: 기존 CSV를 읽고 상위 파라미터를 큐에 삽입
+    # =========================================================
+    csv_path = "results/optuna_trials.csv"
+    if os.path.exists(csv_path):
+        print(f"📊 기존 학습 기록({csv_path})을 발견했습니다. 이전 최적의 모델부터 탐색을 시작합니다.")
+        try:
+            df = pd.read_csv(csv_path)
+            
+            # 학습이 정상적으로 완료된(COMPLETE) 기록만 필터링
+            if 'state' in df.columns:
+                df = df[df['state'] == 'COMPLETE']
+            
+            # MSE(value) 값이 가장 낮은(좋은) 순서대로 오름차순 정렬
+            if 'value' in df.columns:
+                df = df.sort_values(by='value', ascending=True)
+
+                # 상위 N개의 파라미터를 추출하여 큐에 추가 (예: 상위 3개)
+                top_k = 1
+                enqueued_count = 0
+                
+                for _, row in df.head(top_k).iterrows():
+                    # Optuna가 저장한 CSV는 컬럼명에 'params_' 접두사가 붙습니다.
+                    params = {
+                        "model_type": str(row['params_model_type']),
+                        "n_layers": int(row['params_n_layers']),
+                        "hidden_size": int(row['params_hidden_size']),
+                        "batch_size": int(row['params_batch_size'])
+                    }
+                    
+                    # 큐에 파라미터 삽입 (이 조합부터 먼저 학습을 수행함)
+                    study.enqueue_trial(params)
+                    enqueued_count += 1
+                
+                print(f"✅ 상위 {enqueued_count}개의 파라미터 조합을 탐색 큐(Queue)에 추가했습니다!")
+            
+        except Exception as e:
+            print(f"⚠️ CSV 기록을 불러오는 중 오류가 발생했습니다: {e}")
+
+    study.optimize(objective, n_trials=5, show_progress_bar=True)
+
+    # === Optuna 결과 테이블 CSV 저장 ===
+    df = study.trials_dataframe(
+        attrs=("number","value","params","state","user_attrs","datetime_start","datetime_complete","duration")
+    )
+    df.to_csv("results/0optuna_trials.csv", index=False)
+    print("Trials CSV saved → results/optuna_trials.csv")
+
+    # === 베스트 트라이얼 메타 JSON 저장 ===
+    bp = study.best_trial.params
+    best_ckpt = study.best_trial.user_attrs.get(
+        "ckpt_path",
+        f"models/OPTUNA_{bp['model_type']}_L{bp['n_layers']}_H{bp['hidden_size']}_B{bp['batch_size']}.pt"
+    )
+    best_meta = {"best_value": float(study.best_value), "best_params": bp, "best_ckpt": best_ckpt}
+    with open("results/0optuna_best.json", "w", encoding="utf-8") as f:
+        json.dump(best_meta, f, ensure_ascii=False, indent=2)
+        
+    print("\n===== Optuna 결과 =====")
+    print(f"Best value (val MSE): {study.best_value:.6f}")
+    print(f"Best checkpoint: {best_ckpt}")
+    print("Best params:")
+    for k, v in bp.items():
+        print(f"  - {k}: {v}")
+
+# # ===========================
+# # ✅ 베스트 모델 로드 & 테스트 & 25.6초(=IN_LEN) → 25.6초 예측, 6자유도 전체 플롯
+# # ===========================
+
+# import json
+# import matplotlib.pyplot as plt
+
+# # === 저장된 Optuna 결과 불러오기 ===
+# with open("results/optuna_best.json", "r", encoding="utf-8") as f:
+#     best_meta = json.load(f)
+
+# bp = best_meta["best_params"]
+# best_ckpt = best_meta["best_ckpt"]
+
+# # 1) 베스트 파라미터로 모델 재구성 + 체크포인트 로드
+# best_model_type  = bp["model_type"]          # 예: 'Bi-GRU'
+# best_n_layers    = int(bp["n_layers"])
+# best_hidden_size = int(bp["hidden_size"])
+# best_batch_size  = int(bp["batch_size"])
+
+# # 베스트 로더 (평가 용) - TimeWindowDataset 사용
+# test_loader = DataLoader(
+#     TimeWindowDataset(data_6dof, idx_test),
+#     batch_size=best_batch_size, 
+#     shuffle=False, 
+#     drop_last=False
+# )
+
+# # build_model() 재사용
+# best_model = build_model(best_model_type, best_n_layers, best_hidden_size)
+# best_model.load_state_dict(torch.load(best_ckpt, map_location=device))
+# best_model.to(device)
+# best_model.eval()
+
+# crit = nn.MSELoss()
+
+# # 2) 테스트 MSE 계산 - evaluate_seq2seq 사용
+# with torch.no_grad():
+#     test_mse = evaluate(best_model, test_loader, crit)
+# print(f"\n[BEST] Test MSE: {test_mse:.6f}")
+
+# # 4) 25.6초 입력 -> 25.6초 예측
+# @torch.no_grad()
+# def predict_1shot_next(model, X_start):
+#     """
+#     모델이 과거 데이터 전체를 읽어 미래 OUT_LEN 시퀀스를 한 번에 출력합니다.
+#     X_start: (1, IN_LEN, 6)
+#     return: (OUT_LEN, 6) numpy array (scaled)
+#     """
+#     if isinstance(model, nn.DataParallel):
+#         base_model = model.module
+#     else:
+#         base_model = model
+
+#     base_model.eval()
+#     # 단 한 번의 forward pass
+#     out = base_model(X_start.to(device))              # (1, OUT_LEN, 6)
+#     return out.squeeze(0).cpu().numpy()               # (OUT_LEN, 6)
+
+
+# # 4) 테스트 윈도 하나 골라서 시각화
+# idx = 50
+# test_ds = test_loader.dataset
+# X_seq, Y_seq = test_ds[idx]      # 각각 (IN_LEN, 6), (OUT_LEN, 6) 텐서 반환
+
+# X_start = X_seq.unsqueeze(0)     # 배치 차원 추가 -> (1, IN_LEN, 6)
+# Y_truth = Y_seq.unsqueeze(0)     # 배치 차원 추가 -> (1, OUT_LEN, 6)
+
+# pred_all  = predict_1shot_next(best_model, X_start)        # (OUT_LEN, 6)
+# truth_all = Y_truth.squeeze(0).cpu().numpy()               # (OUT_LEN, 6)
+# X_all     = X_start.squeeze(0).cpu().numpy()               # (IN_LEN, 6)
+
+# # 시간 축 (입력: -25.6s ~ 0s, 출력: 0s ~ +25.6s)
+# t_input = np.arange(-X_all.shape[0], 0) / sampling_rate
+# t_pred  = np.arange(pred_all.shape[0]) / sampling_rate
+
+# # DOF 이름
+# DOF_NAMES = ['Surge', 'Sway', 'Heave', 'Roll', 'Pitch', 'Yaw']
+# N_DOF = len(DOF_NAMES)
+
+# plt.figure(figsize=(12, 16))
+
+# for d in range(N_DOF):
+#     plt.subplot(N_DOF, 1, d+1)
+
+#     # 입력 구간 (과거 25.6초)
+#     plt.plot(t_input, X_all[:, d], linestyle="--", alpha=0.7, color="gray",
+#              label=f"Input ({DOF_NAMES[d]})")
+
+#     # 정답 / 예측 (미래 25.6초)
+#     plt.plot(t_pred, truth_all[:, d], linewidth=1.5, color="blue", alpha=0.7,
+#              label=f"Truth ({DOF_NAMES[d]})")
+#     plt.plot(t_pred, pred_all[:, d], linewidth=1.5, color="red", linestyle="-",
+#              label=f"Pred ({DOF_NAMES[d]})")
+
+#     if d == 0:
+#         plt.title(
+#             f"{best_model_type}_L{best_n_layers}_H{best_hidden_size}_B{best_batch_size} — "
+#             f"25.6s Input → 25.6s Prediction (6-DOF, scaled)"
+#         )
+
+#     plt.axvline(0, color="k", linestyle=":", alpha=0.4)
+#     plt.ylabel(DOF_NAMES[d])
+#     plt.grid(True, alpha=0.3)
+#     plt.legend(loc="upper right", fontsize=8)
+
+# plt.xlabel("Time (s)")
+# plt.tight_layout()
+# os.makedirs("results", exist_ok=True)
+# save_path = f"results/OPTUNA_BEST_{best_model_type}_6DOF.png"
+# plt.savefig(save_path, dpi=150)
+# plt.close()
+
+# print(f"📊 시각화 저장 완료: {save_path}")
